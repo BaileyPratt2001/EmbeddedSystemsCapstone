@@ -1,0 +1,133 @@
+// -------- Blynk Config --------
+#define BLYNK_TEMPLATE_ID   "TMPL2VQ7HUUIj"
+#define BLYNK_TEMPLATE_NAME "Current Sensor"
+#define BLYNK_AUTH_TOKEN    "iECjDGuX4bvgAwoRpc8QZaiMmVfPth64"
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+#define RXD2 16
+#define TXD2 17
+
+char auth[] = BLYNK_AUTH_TOKEN;
+char ssid[] = "TTUguest";
+char pass[] = "maskedraiders";
+
+String uartBuffer = "";
+BlynkTimer timer;
+
+// ------------------------------------------------------------
+// Extract Lamp Current RMS from STM32 message
+// Format: "Lamp Current RMS: 7.059 A, Fan Current RMS: 7.064 A"
+// ------------------------------------------------------------
+float parseLamp(String s) {
+    int start = s.indexOf("Lamp Current RMS:");
+    if (start < 0) return -1;
+
+    start += strlen("Lamp Current RMS:");
+    int end = s.indexOf("A", start);
+    if (end < 0) return -1;
+
+    String val = s.substring(start, end);
+    val.trim();
+    return val.toFloat();
+}
+
+// ------------------------------------------------------------
+// Extract Fan Current RMS
+// ------------------------------------------------------------
+float parseFan(String s) {
+    int start = s.indexOf("Fan Current RMS:");
+    if (start < 0) return -1;
+
+    start += strlen("Fan Current RMS:");
+    int end = s.indexOf("A", start);
+    if (end < 0) return -1;
+
+    String val = s.substring(start, end);
+    val.trim();
+    return val.toFloat();
+}
+
+// ------------------------------------------------------------
+// Read UART From STM32 → Stream both RMS currents to Blynk
+// ------------------------------------------------------------
+void readSTM32() {
+    while (Serial2.available()) {
+        char c = Serial2.read();
+
+        if (c == '\n') {
+            Serial.print("STM32 → ");
+            Serial.println(uartBuffer);
+
+            float lamp = parseLamp(uartBuffer);
+            float fan  = parseFan(uartBuffer);
+
+            if (lamp >= 0) {
+                Serial.print("Lamp RMS Parsed: ");
+                Serial.println(lamp);
+                Blynk.virtualWrite(V0, lamp);   // Lamp → V0
+            }
+
+            if (fan >= 0) {
+                Serial.print("Fan RMS Parsed: ");
+                Serial.println(fan);
+                Blynk.virtualWrite(V2, fan);    // Fan → V2
+            }
+
+            uartBuffer = "";
+        } 
+        else {
+            uartBuffer += c;
+        }
+    }
+}
+
+// ------------------------------------------------------------
+// Blynk V1 → Relay 1 Control (KEEP EXACTLY AS YOU SAID)
+// ------------------------------------------------------------
+BLYNK_WRITE(V1) {
+    int cmd = param.asInt();
+
+    if (cmd == 1) {
+        Serial.println("[BLYNK] Relay 1 ON → '1'");
+        Serial2.print("1");
+    } else {
+        Serial.println("[BLYNK] Relay 1 OFF → '2'");
+        Serial2.print("2");
+    }
+}
+
+// ------------------------------------------------------------
+// Blynk V3 → Relay 2 Control (KEEP EXACTLY AS YOU SAID)
+// ------------------------------------------------------------
+BLYNK_WRITE(V3) {
+    int cmd = param.asInt();
+
+    if (cmd == 1) {
+        Serial.println("[BLYNK] Relay 2 ON → '3'");
+        Serial2.print("3");
+    } else {
+        Serial.println("[BLYNK] Relay 2 OFF → '4'");
+        Serial2.print("4");
+    }
+}
+
+// ---------------------- Setup ---------------------------
+void setup() {
+    Serial.begin(115200);
+    Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+
+    Serial.println("ESP32 Ready (Dual RMS Streaming + Relays)");
+
+    Blynk.begin(auth, ssid, pass);
+
+    timer.setInterval(200L, readSTM32);  // Read STM32 every 200 ms
+}
+
+// ---------------------- Loop ---------------------------
+void loop() {
+    Blynk.run();
+    timer.run();
+}
