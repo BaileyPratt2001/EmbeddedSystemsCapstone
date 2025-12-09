@@ -1,0 +1,539 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "adc.h"
+#include "dma.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+#define NUM_TASKS 3
+#define N 512
+#define HALF_SIZE N
+#define SENSING_SAMPLES 1000
+#define RX_BUFFER_SIZE 2
+#define RELAY1_GPIO_PORT GPIOA
+#define RELAY1_PIN GPIO_PIN_8
+#define RELAY2_GPIO_PORT GPIOB
+#define RELAY2_PIN GPIO_PIN_8
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+// signal to task B
+volatile uint8_t FlagNewCurrentData = 0;
+volatile uint8_t TransmissionActiveFlag = 0;
+
+// ADC Buffer
+uint16_t BufferADC[4*N];
+
+// UART
+char SendBufferUART[64] = "";
+uint8_t ReceiveBufferUART[RX_BUFFER_SIZE];
+extern UART_HandleTypeDef huart2;
+volatile uint8_t LampRelayOnFlag = 0;
+volatile uint8_t LampRelayOffFlag = 0;
+volatile uint8_t FanRelayOnFlag = 0;
+volatile uint8_t FanRelayOffFlag = 0;
+
+// DMA flags
+volatile uint8_t flag_half = 0;
+volatile uint8_t flag_full = 0;
+
+// accumulators
+float NoiseRMS = 0.0f;
+
+// current results
+float LampCurrentRMS = 0.0f;
+float FanCurrentRMS = 0.0f;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
+// task functions
+void SensingTASK(uint16_t*);
+void CommunicationTASK();
+void ReceiveTASK();
+
+// wrappers for task functions
+void SensingTaskWrapper(void);
+void CommunicationTaskWrapper(void);
+void ReceiveTaskWrapper(void);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+// user defined state machine types
+typedef enum {
+	sense_init = 0,
+	sense_wait_DMA,
+	sense_process_half,
+	sense_process_full,
+	sense_compute_results
+} SENSE_STATE;
+
+typedef enum {
+	comm_init = 0,
+	comm_wait_flag,
+	comm_send
+} COMM_STATE;
+
+typedef enum {
+	receive_init = 0,
+	receive_wait,
+	receive_lamp_on,
+	receive_lamp_off,
+	receive_fan_on,
+	receive_fan_off
+} RECEIVE_STATE;
+
+// round robin task scheduler structure
+typedef struct{
+	// task function
+	void (*TaskFunction)(void);
+	// period of associated task
+	uint32_t msPeriod;
+	// time elapsed since task's last run
+	uint32_t msElapsed;
+} TaskStruct;
+
+// structure instance held in an array
+TaskStruct tasks[NUM_TASKS];
+
+SENSE_STATE sense_state = sense_init;
+COMM_STATE comm_state = comm_init;
+RECEIVE_STATE receive_state = receive_init;
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+  // 2. Enable the GPIOA clock (since LED2 is on PA5)
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  // 3. Configure PA5 as output
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_TIM8_Init();
+  MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+  MX_TIM2_Init();
+  /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start_IT(&htim2);
+  HAL_TIM_Base_Start_IT(&htim8);
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)BufferADC, 4*N);
+
+  HAL_GPIO_WritePin(RELAY1_GPIO_PORT, RELAY1_PIN, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(RELAY2_GPIO_PORT, RELAY2_PIN, GPIO_PIN_SET);
+  NoiseRMS = 0.0f;
+
+  // initialize tasks array with task information
+
+  // sensing task
+  tasks[0].TaskFunction = SensingTaskWrapper;
+  tasks[0].msPeriod = 5;
+  tasks[0].msElapsed = 0;
+
+  // communication task
+  tasks[1].TaskFunction = CommunicationTaskWrapper;
+  tasks[1].msPeriod = 200;
+  tasks[1].msElapsed = 0;
+
+  // receiving task
+  tasks[2].TaskFunction = ReceiveTaskWrapper;
+  tasks[2].msPeriod = 10;
+  tasks[2].msElapsed = 0;
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+	  for(int i = 0; i < NUM_TASKS; i++){
+		  if(tasks[i].msElapsed >= tasks[i].msPeriod){
+			  tasks[i].msElapsed = 0;
+			  tasks[i].TaskFunction();
+		  }
+	  }
+
+
+  }
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 84;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+void SensingTASK(uint16_t *buff){
+	static double sumSq1 = 0, sumSq2 = 0;
+	static double count = 0;
+	switch(sense_state){
+	case (sense_init):
+			sumSq1 = 0;
+			sumSq2 = 0;
+			count = 0;
+			flag_half = 0;
+			flag_full = 0;
+			sense_state = sense_wait_DMA;
+			break;
+	case (sense_wait_DMA):
+			if(flag_half == 1){
+				sense_state = sense_process_half;
+			}
+			else if(flag_full == 1){
+				sense_state = sense_process_full;
+			}
+			break;
+	case (sense_process_half):
+			flag_half = 0;
+			uint32_t sum1 = 0, sum2 = 0;
+			float mean1 = sum1 / (float)(N/2);
+			float mean2 = sum2 / (float)(N/2);
+			for (int i = 0; i < N; i+=2){
+				float c1 = (float)buff[i] - mean1;
+				float c2 = (float)buff[i+1] - mean2;
+				float v1 = c1 * (3.3f / 4095.0f);
+				float v2 = c2 * (3.3f / 4095.0f);
+				float i1 = v1 / 0.185f;
+				float i2 = v2 / 0.185f;
+				sumSq1 += (double)(i1 * i1);
+				sumSq2 += (double)(i2 * i2);
+				count++;
+				if (count >= SENSING_SAMPLES){
+					break;
+				}
+			}
+			if(count >= SENSING_SAMPLES){
+				sense_state = sense_compute_results;
+			}
+			else
+				sense_state = sense_wait_DMA;
+			break;
+	case (sense_process_full):
+			flag_full = 0;
+			sum1 = 0;
+			sum2 = 0;
+			for (int i = N; i < 2*N; i+=2){
+				sum1 += buff[i];
+				sum2 += buff[i+1];
+			}
+			mean1 = sum1 / (float)(N/2);
+			mean2 = sum2 / (float)(N/2);
+			for (int i = N; i < 2*N; i+=2){
+				float c1 = (float)buff[i] - mean1;
+				float c2 = (float)buff[i+1] - mean2;
+				float v1 = c1 * (3.3f / 4095.0f);
+				float v2 = c2 * (3.3f / 4095.0f);
+				float i1 = v1 / 0.185f;
+				float i2 = v2 / 0.185f;
+				sumSq1 += (double)(i1 * i1);
+				sumSq2 += (double)(i2 * i2);
+				count++;
+				if (count >= SENSING_SAMPLES){
+					break;
+				}
+			}
+			if(count >= SENSING_SAMPLES){
+				sense_state = sense_compute_results;
+			}
+			else
+				sense_state = sense_wait_DMA;
+			break;
+	case (sense_compute_results):
+			LampCurrentRMS = sqrtf((float)sumSq1 / (float)count) - 9.765;
+			FanCurrentRMS = sqrtf((float)sumSq2 / (float)count) - 9.608;
+			if (LampCurrentRMS > 0.04 || !LampRelayOnFlag)
+				LampCurrentRMS = 0.0;
+			if (FanCurrentRMS >= 0.189 || !FanRelayOnFlag)
+				FanCurrentRMS = 0.0;
+			if (LampRelayOnFlag && FanRelayOnFlag){
+				LampCurrentRMS = LampCurrentRMS + 0.162;
+				FanCurrentRMS = FanCurrentRMS + 0.151;
+			}
+			FlagNewCurrentData = 1;
+			sumSq1 = 0.0;
+			sumSq2 = 0.0;
+			count = 0;
+			sense_state = sense_wait_DMA;
+			break;
+	}
+}
+
+void CommunicationTASK(){
+	switch(comm_state){
+	case (comm_init):
+			comm_state = comm_wait_flag;
+			break;
+	case (comm_wait_flag):
+			if(FlagNewCurrentData == 1){
+				comm_state = comm_send;
+			}
+			break;
+	case (comm_send):
+			FlagNewCurrentData = 0;
+			sprintf(SendBufferUART, "Lamp Current RMS: %.3f A, Fan Current RMS: %.3f A\r\n", LampCurrentRMS, FanCurrentRMS);
+			HAL_UART_Transmit(&huart1, (uint8_t*)SendBufferUART, strlen(SendBufferUART), 10);
+			comm_state = comm_wait_flag;
+			break;
+	}
+}
+
+void ReceiveTASK(){
+	switch(receive_state){
+	case (receive_init):
+			receive_state = receive_wait;
+			break;
+	case (receive_wait):
+			if(HAL_UART_Receive(&huart1, ReceiveBufferUART, RX_BUFFER_SIZE-1, 10) == HAL_OK){
+				ReceiveBufferUART[RX_BUFFER_SIZE-1] = '\0';
+				if(strcmp((char*)ReceiveBufferUART, "1") == 0){
+					if(!LampRelayOnFlag){
+						receive_state = receive_lamp_on;
+					}
+				}
+				else if(strcmp((char*)ReceiveBufferUART, "2") == 0){
+					if(!LampRelayOffFlag){
+						receive_state = receive_lamp_off;
+					}
+				}
+				else if(strcmp((char*)ReceiveBufferUART, "3") == 0){
+					if(!FanRelayOnFlag){
+						receive_state = receive_fan_on;
+					}
+				}
+				else if(strcmp((char*)ReceiveBufferUART, "4") == 0){
+					if(!FanRelayOffFlag){
+						receive_state = receive_fan_off;
+					}
+				}
+			}
+			break;
+	case (receive_lamp_on):
+			// active low
+			HAL_GPIO_WritePin(RELAY1_GPIO_PORT, RELAY1_PIN, GPIO_PIN_RESET);
+			LampRelayOnFlag = 1;
+			LampRelayOffFlag = 0;
+			receive_state = receive_wait;
+			break;
+	case (receive_lamp_off):
+			// active low
+			HAL_GPIO_WritePin(RELAY1_GPIO_PORT, RELAY1_PIN, GPIO_PIN_SET);
+			LampRelayOnFlag = 0;
+			LampRelayOffFlag = 1;
+			receive_state = receive_wait;
+			break;
+	case (receive_fan_on):
+			// active low
+			HAL_GPIO_WritePin(RELAY2_GPIO_PORT, RELAY2_PIN, GPIO_PIN_RESET);
+			FanRelayOnFlag = 1;
+			FanRelayOffFlag = 0;
+			receive_state = receive_wait;
+			break;
+	case (receive_fan_off):
+			// active low
+			HAL_GPIO_WritePin(RELAY2_GPIO_PORT, RELAY2_PIN, GPIO_PIN_SET);
+			FanRelayOnFlag = 0;
+			FanRelayOffFlag = 1;
+			receive_state = receive_wait;
+			break;
+	}
+}
+
+// WRAPPERS
+void SensingTaskWrapper(void){
+	SensingTASK(BufferADC);
+}
+void CommunicationTaskWrapper(void){
+	CommunicationTASK();
+}
+void ReceiveTaskWrapper(void){
+	ReceiveTASK();
+}
+
+// DMA complete: second half of buffer filled
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  if (hadc->Instance == ADC1) {
+	  flag_half = 1;
+  }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  if (hadc->Instance == ADC1) {
+	  flag_full = 1;
+  }
+}
+
+// scheduler tick interrupt
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2){
+        for (int i = 0; i < NUM_TASKS; i++){
+            tasks[i].msElapsed++;
+        }
+    }
+}
+
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
